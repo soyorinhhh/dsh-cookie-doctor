@@ -1,0 +1,18 @@
+# dsh-cookie-doctor 的 bundle patch。
+# DSH 会把 dsh.profile.bundles 里每个 bundle 的这份 patch 依次叠加到 profile 上。
+#
+# id 必须和插件注册的服务名区分开（这里没有命名空间配置需求，用包名即可）；
+# name 是 npm 包名，需要能从 profile 的 node_modules 解析到。
+- insert:
+    - id: cookie-doctor
+      name: dsh-cookie-doctor
+      config:
+        # 抬高 Node 的请求头上限，让「已经攒了几十条」的机器仍然能启动；
+        # 0 表示不动默认值（不推荐，默认值就是 16KB 那个坑）。
+        maxHeaderBytes: 262144
+        # 把本轮 authority 之外的 dsh-auth-* cookie 逐条过期掉。
+        purgeStale: true
+        # 一条响应里最多带多少条过期指令。
+        maxPurgePerResponse: 200
+        # 超过这么多条 dsh-auth-* 就在日志里警告一次。
+        warnAuthCookies: 8
