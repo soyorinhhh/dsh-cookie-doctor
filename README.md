@@ -1,6 +1,6 @@
 # dsh-cookie-doctor
 
-治好 DeepSeek Harness 桌面版「**桌面版重启若干次后必定启动失败，报 `desktop welcome: Web authentication failed`**」的那个 bug —— 不用重装、不用禁用插件，也不会再复发。
+治好 DeepSeek Harness 桌面版「**桌面版重启若干次后必定启动失败，报 `desktop welcome: Web authentication failed`**」的那个 bug —— 不用重装、不用禁用插件，也不会再复发。（注意：100%vibe coding，来源自DeepSeek V4.1 Flash Harness端）
 
 > 症状：桌面版重启 N 次后（实测第 73 次）必定起不来，弹窗建议重装或禁用插件。
 > 手动修法是把 `%APPDATA%\@deepseek-ai\dsh-desktop\Network\Cookies` 删掉，但重启几十次后又会犯。
