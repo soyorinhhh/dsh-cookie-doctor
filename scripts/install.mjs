@@ -101,7 +101,16 @@ function removeLink(entryPath, dryRun) {
 }
 
 function readJson(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  // 去 BOM：PowerShell 的 Set-Content / 记事本另存都会写 UTF-8 BOM，
+  // JSON.parse 遇到它会直接抛 "Unexpected token"，用户手动改过 profile 就踩坑。
+  const text = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/u, '');
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    console.error(`✗ ${path.basename(filePath)} 不是合法 JSON：${error && error.message ? error.message : error}`);
+    console.error('  先修好它，或用同目录下的 package.json.bak-* 还原，再重新运行。');
+    process.exit(6);
+  }
 }
 
 function writeJsonWithBackup(filePath, data, dryRun) {
@@ -110,11 +119,45 @@ function writeJsonWithBackup(filePath, data, dryRun) {
   // 先判断 dry-run 再打印：否则会输出「备份了」但其实什么都没做，误导使用者。
   if (dryRun) {
     console.log(`   将备份 ${path.basename(filePath)} 并写入新内容`);
-    return;
+    return undefined;
   }
   console.log(`   备份 ${path.basename(filePath)} → ${path.basename(backup)}`);
   fs.copyFileSync(filePath, backup);
   fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  return backup;
+}
+
+/**
+ * 回读 profile 的 package.json，确认两处接线真的写进去了。
+ *
+ * DSH 自己的 plugin_manager 才是这条记录的正主，本脚本是「没装 DSH 工具时的等价手段」；
+ * 既然绕过了它，就必须自己保证写进去的东西回读得到，否则会出现
+ * 「脚本说装好了、DSH 却不加载」的半改状态。
+ */
+function verifyProfileWiring(profilePkgPath, installed) {
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(profilePkgPath, 'utf8'));
+  } catch {
+    return false;
+  }
+  const bundles = Array.isArray(pkg?.dsh?.profile?.bundles) ? pkg.dsh.profile.bundles : [];
+  const listed = bundles.includes(PACKAGE_NAME);
+  const dependency = pkg?.dependencies?.[PACKAGE_NAME];
+  return installed ? listed && typeof dependency === 'string' : !listed && dependency === undefined;
+}
+
+/** 写入 + 回读校验；校验失败就还原备份并退出，绝不留半改状态。 */
+function commitProfileChange(profilePkgPath, pkg, installed, dryRun) {
+  const backup = writeJsonWithBackup(profilePkgPath, pkg, dryRun);
+  if (dryRun) return;
+  if (verifyProfileWiring(profilePkgPath, installed)) return;
+  console.error('✗ 写入后回读校验失败（profile/package.json 没落到预期状态）');
+  if (backup !== undefined && fs.existsSync(backup)) {
+    fs.copyFileSync(backup, profilePkgPath);
+    console.error(`  已从备份还原：${path.basename(backup)}`);
+  }
+  process.exit(5);
 }
 
 function main() {
@@ -165,7 +208,7 @@ function main() {
     }
     profilePkg.dsh.profile.bundles = nextBundles;
     delete profilePkg.dependencies[PACKAGE_NAME];
-    writeJsonWithBackup(profilePkgPath, profilePkg, args.dryRun);
+    commitProfileChange(profilePkgPath, profilePkg, false, args.dryRun);
     console.log('\n✅ 已卸载，重启 DSH 后生效。');
     return;
   }
@@ -186,11 +229,14 @@ function main() {
     console.log('   dsh.profile.bundles 里已经有了');
   }
   profilePkg.dsh.profile.bundles = bundles;
-  writeJsonWithBackup(profilePkgPath, profilePkg, args.dryRun);
+  commitProfileChange(profilePkgPath, profilePkg, true, args.dryRun);
 
   console.log('\n✅ 安装完成。');
   console.log('   重启 DeepSeek Harness 后插件生效；想确认是否真的生效，重启后看：');
   console.log(`   ${path.join(home, 'cookie-doctor', 'report.json')}`);
+  console.log('\n注意：这个脚本直接改写 profile 的 package.json（因为不依赖 pnpm / 联网）。');
+  console.log('      DSH 自带的插件管理器是同一份记录的正主，之后若用它装卸插件，');
+  console.log('      以管理器显示的状态为准；本脚本只负责 junction + 这两处字段。');
   if (args.dryRun) console.log('\n（dry-run，没有真正改动任何文件）');
 }
 

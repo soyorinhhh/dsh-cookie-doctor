@@ -87,7 +87,12 @@ node scripts/install.mjs --dry-run  # 先看它要干什么
 
 1. `~/.dsh/plugins/dsh-cookie-doctor` → 指向本仓库（Windows 用 junction，不用管理员权限）
 2. `<profile>/node_modules/dsh-cookie-doctor` → 指向上面的目录，让 Node 能解析到
-3. 在 profile 的 `package.json` 里加上 `dependencies` 和 `dsh.profile.bundles`（改之前自动备份）
+3. 在 profile 的 `package.json` 里加上 `dependencies` 和 `dsh.profile.bundles`
+   （改之前自动备份，写完回读校验，对不上就自动还原）
+
+> 脚本直接改写 profile 的 `package.json`，因为要保证不依赖 pnpm / 联网。
+> DSH 自带的插件管理器是同一份记录的正主；之后若用它装卸插件，以管理器显示的状态为准。
+> 读文件时会去掉 UTF-8 BOM（PowerShell / 记事本存过的文件也能正常处理）。
 
 然后**重启 DeepSeek Harness**。控制台会打印一行：
 
@@ -162,11 +167,20 @@ cookie 总数：80（其中 dsh-auth-* 80 条，其它 0 条）
 | `reportPath` | `$DSH_HOME/cookie-doctor/report.json` | 统计落盘位置 |
 | `quiet` | `false` | 关掉日志 |
 
+这个插件不引入 schemastery（保持「零依赖」），所以没有 Config schema，
+校验在 `readOptions()` 里自己做：**拼错的键名、写错的类型都会打一条 warn 并回落默认值**，
+不再静默失效。例如 `maxHeaderByte`（少个 s）会报：
+
+```
+[cookie-doctor] 未知配置项 maxHeaderByte，已忽略。可用项：maxHeaderBytes, purgeStale, ...
+```
+
 ## 测试
 
 ```bash
-node test/simulate.mjs      # 复现故障 + 验证修复（含病发机器自愈）
+node test/simulate.mjs      # 复现故障 + 验证修复（含病发机器自愈、TLS、兜底挂载）
 node test/repair.test.mjs   # 体检/修复脚本，用 Chromium 同结构的 cookie 库跑
+node test/config.test.mjs   # 配置校验：错键名/错类型必须报出来并回落
 ```
 
 ```
@@ -200,6 +214,25 @@ node test/repair.test.mjs   # 体检/修复脚本，用 Chromium 同结构的 co
 - 插件对 `apply()` 做了整体 try/catch：即使初始化异常也只会打一行警告，不会让 host 启动失败。
 
 ## 更新记录
+
+### v0.1.2
+
+继续收掉审查里剩下的三条（都是「能用但脆」的问题）：
+
+- **不再依赖 `webServer.server` 这个内部字段**。清理改成挂文档化的
+  `connection/request` waterfall 事件；拿不到 `http.Server` 时只影响「抬高上限」
+  这一项（已经病发的机器），清理照常工作。同时把 server 的查找放宽成按形状匹配，
+  并用限时轮询补上 `maxHeaderSize`。
+  - 顺带修了一个形状判断的坑：Node 的 `http.Server` 在没配过上限时
+    `maxHeaderSize` 是 `undefined`，要求它是 `number` 会永远匹配不上。
+- **配置校验**：新增 `test/config.test.mjs`。拼错的键名、写错的类型都会 warn 并回落默认值
+  （原来 `purgeStale: "false"` 这种会被静默当成 `true`）。
+- **`install.mjs` 改写 profile 的 package.json 后回读校验**，失败自动从备份还原并退出；
+  输出里明确它与 DSH 自带插件管理器并存的关系。
+- `install.mjs` 修掉两个实际踩到的坑：`readJson` 不认 UTF-8 **BOM**
+  （PowerShell / 记事本存过的文件会直接崩栈），现在去 BOM 并给可读的错误提示。
+- 测试：`simulate` 新增场景 E（没有 `connection/request` 时走 `http.Server` 兜底），
+  并把主路径改成走真实的事件链路。
 
 ### v0.1.1
 

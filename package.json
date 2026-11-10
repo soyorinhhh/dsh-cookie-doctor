@@ -1,6 +1,6 @@
 {
   "name": "dsh-cookie-doctor",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "license": "MIT",
   "description": "治好 DeepSeek Harness 桌面版「Web authentication failed」无限重启崩溃：清理堆积的 dsh-auth-* cookie，并阻止它们再次堆积",
@@ -22,9 +22,10 @@
     }
   },
   "scripts": {
-    "test": "node test/simulate.mjs && node test/repair.test.mjs",
+    "test": "node test/simulate.mjs && node test/repair.test.mjs && node test/config.test.mjs",
     "test:simulate": "node test/simulate.mjs",
     "test:repair": "node test/repair.test.mjs",
+    "test:config": "node test/config.test.mjs",
     "diagnose": "node scripts/diagnose.mjs",
     "repair": "node scripts/repair.mjs",
     "install-plugin": "node scripts/install.mjs"

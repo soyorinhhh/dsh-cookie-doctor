@@ -104,8 +104,9 @@ class FakeJar {
   }
 }
 
-function createHost({ withPlugin, reportPath, secure = false }) {
+function createHost({ withPlugin, reportPath, secure = false, useEvent = true }) {
   const launchToken = encodeBase64Url(randomBytes(32));
+  const listeners = new Map();
 
   const handler = (req, res) => {
     const url = new URL(req.url, 'http://dsh.invalid');
@@ -140,18 +141,50 @@ function createHost({ withPlugin, reportPath, secure = false }) {
     res.end('{"ok":true}');
   };
 
-  const server = http.createServer(handler);
-  if (withPlugin) {
-    applyPlugin(
-      {
-        // protocol 是上游 requestAudience() 判断 TLS 的同一来源；
-        // 这里换成 https: 就能在纯 http 通道上验证插件的命名分支。
-        webServer: { server, protocol: secure ? 'https:' : 'http:' },
-        effect: (fn) => fn(),
-        logger: { info() {}, warn() {} }
-      },
-      { reportPath, quiet: true }
+  const server = http.createServer((req, res) => {
+    // 真实 host 里 client-connection 是这么跑的：
+    //   webCtx.waterfall('connection/request', req, res, () => bridge(...))
+    // 插件现在挂在这个 waterfall 上，所以模拟器也要走同一条路径。
+    const chain = listeners.get('connection/request') ?? [];
+    if (chain.length === 0) {
+      handler(req, res);
+      return;
+    }
+    const composed = chain.reduceRight(
+      (next, listener) => () => listener(req, res, next),
+      () => handler(req, res)
     );
+    Promise.resolve()
+      .then(composed)
+      .catch((error) => {
+        try {
+          res.writeHead(500, { 'content-type': 'text/plain' });
+          res.end(String(error));
+        } catch {}
+      });
+  });
+
+  if (withPlugin) {
+    const ctx = {
+      // protocol 是上游 requestAudience() 判断 TLS 的同一来源；
+      // 这里换成 https: 就能在纯 http 通道上验证插件的命名分支。
+      webServer: { server, protocol: secure ? 'https:' : 'http:' },
+      effect: (fn) => fn(),
+      logger: { info() {}, warn() {} }
+    };
+    if (useEvent) {
+      // 模拟 Cordis 的事件注册：返回 disposer。
+      ctx.on = (event, listener) => {
+        if (!listeners.has(event)) listeners.set(event, []);
+        const list = listeners.get(event);
+        list.push(listener);
+        return () => {
+          const at = list.indexOf(listener);
+          if (at !== -1) list.splice(at, 1);
+        };
+      };
+    }
+    applyPlugin(ctx, { reportPath, quiet: true });
   }
   return { server, launchToken };
 }
@@ -173,8 +206,8 @@ function send(port, { cookie, token, pathname = '/' }) {
 const listen = (server) => new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
 const close = (server) => new Promise((r) => server.close(r));
 
-async function launchOnce({ withPlugin, jar, reportPath, secure = false }) {
-  const { server, launchToken } = createHost({ withPlugin, reportPath, secure });
+async function launchOnce({ withPlugin, jar, reportPath, secure = false, useEvent = true }) {
+  const { server, launchToken } = createHost({ withPlugin, reportPath, secure, useEvent });
   const port = await listen(server);
 
   // 1) 换 token：带上次遗留的 cookie（cookie 不按端口隔离，会被一起发出去）
@@ -195,7 +228,7 @@ async function launchOnce({ withPlugin, jar, reportPath, secure = false }) {
   };
 }
 
-async function scenario({ withPlugin, preload, launches, secure = false }) {
+async function scenario({ withPlugin, preload, launches, secure = false, useEvent = true }) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'cookie-doctor-'));
   const reportPath = path.join(dir, 'report.json');
   const jar = new FakeJar();
@@ -204,7 +237,7 @@ async function scenario({ withPlugin, preload, launches, secure = false }) {
   const rows = [];
   let firstFailure = null;
   for (let i = 1; i <= launches; i++) {
-    const row = await launchOnce({ withPlugin, jar, reportPath, secure });
+    const row = await launchOnce({ withPlugin, jar, reportPath, secure, useEvent });
     rows.push({ launch: i, ...row });
     const broken = row.authStatus !== 303 || row.welcomeStatus !== 200;
     if (firstFailure === null && broken) firstFailure = { launch: i, ...row };
@@ -244,6 +277,14 @@ async function main() {
   );
   console.log(`  D 每次启动后的库中条数：${D.rows.map((r) => r.jarSize).join(' → ')}`);
 
+  // E 验证兜底路径：老版本 host 没有 connection/request 事件时，
+  // 插件会退回去直接挂 http.Server 的 request。这条路径不能被改坏。
+  const E = summarize(
+    'E. 没有 connection/request 事件（走 http.Server 兜底）',
+    await scenario({ withPlugin: true, preload: 0, launches: 4, useEvent: false })
+  );
+  console.log(`  E 每次启动后的库中条数：${E.rows.map((r) => r.jarSize).join(' → ')}`);
+
   const checks = [
     ['A 必须复现失败', A.failed === true],
     ['A 失败时请求头超过 16KB', A.firstFailure ? A.firstFailure.requestHeaderBytes > NODE_DEFAULT_MAX_HEADER_BYTES : false],
@@ -253,7 +294,9 @@ async function main() {
     ['C 病发机器不再失败', C.failed === false],
     ['C 自愈后库里只剩 1 条', C.last.jarSize === 1],
     ['D HTTPS 下不得失败（不能删掉当前 cookie）', D.failed === false],
-    ['D HTTPS 下库里稳定剩 1 条', D.last.jarSize === 1]
+    ['D HTTPS 下库里稳定剩 1 条', D.last.jarSize === 1],
+    ['E 兜底路径不得失败', E.failed === false],
+    ['E 兜底路径下库里只剩 1 条', E.last.jarSize === 1]
   ];
 
   console.log('\n==== 断言 ====');
