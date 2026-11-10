@@ -55,23 +55,49 @@ function linkDirectory(target, linkPath, dryRun) {
   }
 }
 
+/** 路径是不是链接（含 Windows junction）。只看类型，不看存在性。 */
 function isSymlink(target) {
   try {
-    fs.lstatSync(target);
-    return true;
+    return fs.lstatSync(target).isSymbolicLink();
   } catch {
     return false;
   }
 }
 
-function removeLink(linkPath, dryRun) {
-  if (!isSymlink(linkPath)) {
-    console.log(`   不存在：${linkPath}`);
-    return;
+/** 真实目录里是不是本插件（copy 兜底时才会是真实目录）。 */
+function looksLikeOurPackage(dirPath) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dirPath, 'package.json'), 'utf8'));
+    return pkg.name === PACKAGE_NAME;
+  } catch {
+    return false;
   }
-  console.log(`   删除 ${linkPath}`);
-  if (dryRun) return;
-  fs.rmSync(linkPath, { recursive: false, force: true });
+}
+
+/**
+ * 删除一个安装入口。
+ * 链接直接 unlink；真实目录（复制兜底产生的）要先确认它是我们的包，
+ * 否则宁可跳过 —— 旧版把「存在」当成「是链接」，对真实目录 rmSync 会直接抛错，
+ * 更糟的情况是删掉一个不是本插件的目录。
+ */
+function removeLink(entryPath, dryRun) {
+  let stat;
+  try {
+    stat = fs.lstatSync(entryPath);
+  } catch {
+    console.log(`   不存在：${entryPath}`);
+    return false;
+  }
+  const link = stat.isSymbolicLink();
+  if (!link && stat.isDirectory() && !looksLikeOurPackage(entryPath)) {
+    console.log(`   ⚠ 不是链接、也不像本插件的目录，跳过：${entryPath}`);
+    return false;
+  }
+  console.log(`   ${link ? '删除链接' : '删除目录'} ${entryPath}`);
+  if (dryRun) return true;
+  if (link) fs.unlinkSync(entryPath);
+  else fs.rmSync(entryPath, { recursive: true, force: true });
+  return true;
 }
 
 function readJson(filePath) {
@@ -81,8 +107,12 @@ function readJson(filePath) {
 function writeJsonWithBackup(filePath, data, dryRun) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backup = `${filePath}.bak-${stamp}`;
+  // 先判断 dry-run 再打印：否则会输出「备份了」但其实什么都没做，误导使用者。
+  if (dryRun) {
+    console.log(`   将备份 ${path.basename(filePath)} 并写入新内容`);
+    return;
+  }
   console.log(`   备份 ${path.basename(filePath)} → ${path.basename(backup)}`);
-  if (dryRun) return;
   fs.copyFileSync(filePath, backup);
   fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
 }

@@ -27,11 +27,17 @@ const SECRET = randomBytes(32);
 const encodeBase64Url = (v) =>
   Buffer.from(v).toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
 
-function requestAuthority(headers) {
+/**
+ * 上游 requestAudience() 的模型。**两边必须同步**：插件是为它做镜像的，
+ * 这里写错就会变成「自己跟自己一致」的自证测试（HTTPS 分支曾因此漏测）。
+ * 明文监听 → url.host；TLS 监听 → url.origin（带 https:// 前缀）。
+ */
+function requestAudience(headers, secure = false) {
   const host = headers?.host;
   if (typeof host !== 'string') return undefined;
   try {
-    return new URL(`http://${host}`).host;
+    const url = new URL(`${secure ? 'https:' : 'http:'}//${host}`);
+    return secure ? url.origin : url.host;
   } catch {
     return undefined;
   }
@@ -98,12 +104,12 @@ class FakeJar {
   }
 }
 
-function createHost({ withPlugin, reportPath }) {
+function createHost({ withPlugin, reportPath, secure = false }) {
   const launchToken = encodeBase64Url(randomBytes(32));
 
   const handler = (req, res) => {
     const url = new URL(req.url, 'http://dsh.invalid');
-    const authority = requestAuthority(req.headers);
+    const authority = requestAudience(req.headers, secure);
     const tokens = url.searchParams.getAll('token');
 
     if (tokens.length > 0) {
@@ -137,7 +143,13 @@ function createHost({ withPlugin, reportPath }) {
   const server = http.createServer(handler);
   if (withPlugin) {
     applyPlugin(
-      { webServer: { server }, effect: (fn) => fn(), logger: { info() {}, warn() {} } },
+      {
+        // protocol 是上游 requestAudience() 判断 TLS 的同一来源；
+        // 这里换成 https: 就能在纯 http 通道上验证插件的命名分支。
+        webServer: { server, protocol: secure ? 'https:' : 'http:' },
+        effect: (fn) => fn(),
+        logger: { info() {}, warn() {} }
+      },
       { reportPath, quiet: true }
     );
   }
@@ -161,8 +173,8 @@ function send(port, { cookie, token, pathname = '/' }) {
 const listen = (server) => new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
 const close = (server) => new Promise((r) => server.close(r));
 
-async function launchOnce({ withPlugin, jar, reportPath }) {
-  const { server, launchToken } = createHost({ withPlugin, reportPath });
+async function launchOnce({ withPlugin, jar, reportPath, secure = false }) {
+  const { server, launchToken } = createHost({ withPlugin, reportPath, secure });
   const port = await listen(server);
 
   // 1) 换 token：带上次遗留的 cookie（cookie 不按端口隔离，会被一起发出去）
@@ -183,7 +195,7 @@ async function launchOnce({ withPlugin, jar, reportPath }) {
   };
 }
 
-async function scenario({ withPlugin, preload, launches }) {
+async function scenario({ withPlugin, preload, launches, secure = false }) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'cookie-doctor-'));
   const reportPath = path.join(dir, 'report.json');
   const jar = new FakeJar();
@@ -192,7 +204,7 @@ async function scenario({ withPlugin, preload, launches }) {
   const rows = [];
   let firstFailure = null;
   for (let i = 1; i <= launches; i++) {
-    const row = await launchOnce({ withPlugin, jar, reportPath });
+    const row = await launchOnce({ withPlugin, jar, reportPath, secure });
     rows.push({ launch: i, ...row });
     const broken = row.authStatus !== 303 || row.welcomeStatus !== 200;
     if (firstFailure === null && broken) firstFailure = { launch: i, ...row };
@@ -224,6 +236,14 @@ async function main() {
   const C = summarize('C. 装插件 + 已攒 76 条（病发机器）', await scenario({ withPlugin: true, preload: 76, launches: 5 }));
   console.log(`  C 每次启动后的库中条数：${C.rows.map((r) => r.jarSize).join(' → ')}`);
 
+  // D 验证 TLS 分支：上游对 TLS 监听用 url.origin 当 authority（带 https:// 前缀）。
+  // 插件如果只会算 host 形式，就会把当前会话那条当成历史垃圾删掉 → 每轮都掉登录态。
+  const D = summarize(
+    'D. HTTPS 监听（cookie 名按 origin 计算）',
+    await scenario({ withPlugin: true, preload: 0, launches: 4, secure: true })
+  );
+  console.log(`  D 每次启动后的库中条数：${D.rows.map((r) => r.jarSize).join(' → ')}`);
+
   const checks = [
     ['A 必须复现失败', A.failed === true],
     ['A 失败时请求头超过 16KB', A.firstFailure ? A.firstFailure.requestHeaderBytes > NODE_DEFAULT_MAX_HEADER_BYTES : false],
@@ -231,7 +251,9 @@ async function main() {
     ['B 请求头保持 < 2KB', B.maxBytes < 2048],
     ['B 结束时库里只剩 1 条', B.last.jarSize === 1],
     ['C 病发机器不再失败', C.failed === false],
-    ['C 自愈后库里只剩 1 条', C.last.jarSize === 1]
+    ['C 自愈后库里只剩 1 条', C.last.jarSize === 1],
+    ['D HTTPS 下不得失败（不能删掉当前 cookie）', D.failed === false],
+    ['D HTTPS 下库里稳定剩 1 条', D.last.jarSize === 1]
   ];
 
   console.log('\n==== 断言 ====');

@@ -7,16 +7,17 @@
  * 已经在用插件的机器不需要它 —— 插件会自己保持只有 1 条。
  *
  * 用法：
- *   node scripts/repair.mjs --dry-run      # 先看看会删多少
- *   node scripts/repair.mjs                # 真删（会先自动备份）
- *   node scripts/repair.mjs --keep-latest  # 保留最新那条，其余删掉
- *   node scripts/repair.mjs --db <path>    # 指定 Cookies 文件
+ *   node scripts/repair.mjs --dry-run       # 先看看会删多少（不改任何数据）
+ *   node scripts/repair.mjs --yes           # 真删（会先自动备份）；交互终端里可以省略 --yes
+ *   node scripts/repair.mjs --keep-latest   # 保留最新创建的那条，其余删掉
+ *   node scripts/repair.mjs --db <path>     # 指定 Cookies 文件
  *
  * 运行前必须完全退出 DeepSeek Harness（托盘里也要退）。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline/promises';
 import { defaultCookieDbPath, readCookies } from './diagnose.mjs';
 
 const COOKIE_PREFIX = 'dsh-auth-';
@@ -37,6 +38,12 @@ function parseArgs(argv) {
 
 function log(args, message) {
   if (!args.json) console.log(message);
+}
+
+/** 交互确认：只在终端里问。非交互环境由调用方要求 --yes。 */
+function ask(question) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return rl.question(question).finally(() => rl.close());
 }
 
 async function main() {
@@ -60,21 +67,52 @@ async function main() {
     return;
   }
 
-  // 找出最新的一条（creation_utc 最大），--keep-latest 时保留它
-  let keepNames = new Set();
+  // 找出「最新创建」的那条，--keep-latest 时保留它。
+  // 用 creation_utc 而不是 expires_utc：过期时间是签发那一刻按寿命算出来的，
+  // 顺序未必和创建顺序一致，拿它排会留错人。
+  const keepNames = new Set();
   if (args.keepLatest) {
-    const latest = [...targets].sort((a, b) => Number(b.expires_utc ?? 0) - Number(a.expires_utc ?? 0))[0];
+    const latest = [...targets]
+      .sort((a, b) => Number(b.creation_utc ?? 0) - Number(a.creation_utc ?? 0))[0];
     if (latest) keepNames.add(String(latest.name));
   }
   const doomed = targets.filter((row) => !keepNames.has(String(row.name)));
+  // 同一个名字可能在多个 host 下各有一行，按名字去重后逐条删。
+  const doomedNames = [...new Set(doomed.map((row) => String(row.name)))];
+  const keptCount = targets.length - doomed.length;
 
-  log(args, `dsh-auth-* 共 ${targets.length} 条，将删除 ${doomed.length} 条${keepNames.size ? '，保留 1 条' : ''}`);
+  log(
+    args,
+    `dsh-auth-* 共 ${targets.length} 条，将删除 ${doomed.length} 条` +
+      (keptCount > 0 ? `，保留 ${keptCount} 条` : '')
+  );
   if (args.dryRun) {
     log(args, '（--dry-run，没有改动任何数据）');
     if (args.json) {
-      console.log(JSON.stringify({ ok: true, dryRun: true, total: targets.length, wouldRemove: doomed.length }, null, 2));
+      console.log(
+        JSON.stringify(
+          { ok: true, dryRun: true, total: targets.length, wouldRemove: doomed.length, wouldKeep: keptCount },
+          null,
+          2
+        )
+      );
     }
     return;
+  }
+
+  // 这是会写 Chromium cookie 库的破坏性操作：非交互环境必须显式 --yes，
+  // 交互环境问一次。之前没有任何确认，一条命令就直接改库。
+  if (!args.yes) {
+    if (!process.stdin.isTTY) {
+      console.error('✗ 非交互环境必须显式加 --yes（会修改 Chromium 的 cookie 库）');
+      console.error('  先看看会删什么：node scripts/repair.mjs --dry-run');
+      process.exit(4);
+    }
+    const answer = await ask(`即将删除 ${doomed.length} 条 dsh-auth-* cookie，继续？[y/N] `);
+    if (!/^y(es)?$/iu.test(answer.trim())) {
+      log(args, '已取消，没有改动任何数据。');
+      return;
+    }
   }
 
   // 写之前先备份，出问题可以直接还原
@@ -88,9 +126,19 @@ async function main() {
   let removed = 0;
   try {
     db = new DatabaseSync(dbPath);
-    const statement = db.prepare('DELETE FROM cookies WHERE name LIKE ?');
-    const result = statement.run(`${COOKIE_PREFIX}%`);
-    removed = Number(result?.changes ?? 0);
+    // 按名字逐条删。不能用 `DELETE ... WHERE name LIKE 'dsh-auth-%'`：
+    // 那是无条件全清，--keep-latest 要留的那条会被一起删掉（旧版实测 3 条全没了）。
+    const statement = db.prepare('DELETE FROM cookies WHERE name = ?');
+    db.exec('BEGIN');
+    try {
+      for (const name of doomedNames) {
+        removed += Number(statement.run(name)?.changes ?? 0);
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
     db.exec('PRAGMA optimize');
   } catch (error) {
     const message = String(error && error.message ? error.message : error);
@@ -108,7 +156,7 @@ async function main() {
   log(args, `✅ 删掉 ${removed} 条，库里现在还剩 ${remaining} 条 dsh-auth-* cookie`);
   log(args, '现在可以重新启动 DeepSeek Harness 了。建议顺手装上插件，避免再次堆积。');
   if (args.json) {
-    console.log(JSON.stringify({ ok: true, removed, remaining, backup: backupPath }, null, 2));
+    console.log(JSON.stringify({ ok: true, removed, remaining, kept: keptCount, backup: backupPath }, null, 2));
   }
 }
 

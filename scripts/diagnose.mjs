@@ -57,8 +57,11 @@ export async function readCookies(dbPath) {
   let db;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
+    // creation_utc 必须查：repair.mjs --keep-latest 靠它判断哪条是最新创建的。
+    // 少了这一列，排序键恒为 undefined，会留下最旧的那条。
     const rows = db.prepare(
-      'SELECT host_key, name, path, length(value) AS valueLength, length(encrypted_value) AS encryptedLength, expires_utc FROM cookies'
+      'SELECT host_key, name, path, creation_utc, expires_utc, ' +
+        'length(value) AS valueLength, length(encrypted_value) AS encryptedLength FROM cookies'
     ).all();
     return { ok: true, rows, path: dbPath };
   } catch (error) {

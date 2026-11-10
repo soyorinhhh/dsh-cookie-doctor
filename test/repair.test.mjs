@@ -56,6 +56,14 @@ function run(args) {
   return { code: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 
+/** 库里还剩哪些 dsh-auth-* 名字（按名字排序，便于断言）。 */
+function authNames(dbPath) {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const rows = db.prepare("SELECT name FROM cookies WHERE name LIKE 'dsh-auth-%' ORDER BY name").all();
+  db.close();
+  return rows.map((row) => String(row.name));
+}
+
 const dir = mkdtempSync(path.join(os.tmpdir(), 'cookie-doctor-db-'));
 const dbPath = path.join(dir, 'Cookies');
 let failures = 0;
@@ -113,6 +121,37 @@ try {
   } catch {}
   check('剩下的是那 3 条普通 cookie', afterJson?.total === 3 && afterJson?.otherCookies === 3, `total=${afterJson?.total}`);
   check('判定变回 healthy', afterJson?.verdict === 'healthy', `verdict=${afterJson?.verdict}`);
+
+  // --keep-latest 曾经完全没生效：日志说「保留 1 条」，实际是无条件全删。
+  console.log('\n== repair --keep-latest ==');
+  const keepDb = path.join(dir, 'Cookies-keep');
+  createFixture(keepDb, 5, 2);
+  const keepRun = run(['scripts/repair.mjs', '--db', keepDb, '--keep-latest', '--yes', '--json']);
+  let keepJson = null;
+  try {
+    keepJson = JSON.parse(keepRun.stdout);
+  } catch {}
+  const kept = authNames(keepDb);
+  // createFixture 里 creation_utc = 1000 + i，最后插入的那条 i=4 最新
+  const expectedNewest = `dsh-auth-${String(4).padStart(43, 'a')}`;
+  check('repair --keep-latest 正常退出', keepRun.code === 0, `exit=${keepRun.code} ${keepRun.stderr.slice(0, 120)}`);
+  check('只留 1 条 dsh-auth-*', kept.length === 1, `剩 ${kept.length} 条：[${kept.join(', ')}]`);
+  check('留下的正是创建时间最新那条', kept[0] === expectedNewest, `实际 ${kept[0]}`);
+  check('removed 报的是 4（不是 5）', keepJson?.removed === 4, `removed=${keepJson?.removed}`);
+  check('普通 cookie 不受影响', (() => {
+    const db = new DatabaseSync(keepDb, { readOnly: true });
+    const n = db.prepare('SELECT count(*) AS c FROM cookies').get().c;
+    db.close();
+    return n === 3; // 1 条保留的 dsh-auth-* + 2 条普通
+  })());
+
+  console.log('\n== repair 没有 --yes 时必须拒绝 ==');
+  const refuseDb = path.join(dir, 'Cookies-refuse');
+  createFixture(refuseDb, 4, 1);
+  const refused = run(['scripts/repair.mjs', '--db', refuseDb, '--json']);
+  check('非交互环境拒绝执行（exit=4）', refused.code === 4, `exit=${refused.code}`);
+  check('拒绝时一条都没删', authNames(refuseDb).length === 4, `剩 ${authNames(refuseDb).length} 条`);
+  check('拒绝时不产生备份文件', !readdirSync(dir).some((f) => f.startsWith('Cookies-refuse.bak-')));
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }

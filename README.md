@@ -1,6 +1,6 @@
 # dsh-cookie-doctor
 
-治好 DeepSeek Harness 桌面版「**桌面版重启若干次后必定启动失败，报 `desktop welcome: Web authentication failed`**」的那个 bug —— 不用重装、不用禁用插件，也不会再复发。（注意：100%vibe coding，来源自DeepSeek V4.1 Flash Harness端）
+治好 DeepSeek Harness 桌面版「**桌面版重启若干次后必定启动失败，报 `desktop welcome: Web authentication failed`**」的那个 bug —— 不用重装、不用禁用插件，也不会再复发。
 
 > 症状：桌面版重启 N 次后（实测第 73 次）必定起不来，弹窗建议重装或禁用插件。
 > 手动修法是把 `%APPDATA%\@deepseek-ai\dsh-desktop\Network\Cookies` 删掉，但重启几十次后又会犯。
@@ -27,10 +27,11 @@ function cookieName(authority) {
 而 `authority` 来自请求头里的 `host`：
 
 ```js
-function requestAuthority(headers) {
+function requestAudience(headers, secure) {
     const host = header(headers, "host");          // "127.0.0.1:54321"
     ...
-    return new URL(`http://${host}`).host;
+    const url = new URL(`${secure ? "https:" : "http:"}//${host}`);
+    return secure ? url.origin : url.host;         // ← TLS 监听用 origin
 }
 ```
 
@@ -103,14 +104,23 @@ node scripts/install.mjs --dry-run  # 先看它要干什么
 
 ```bash
 # 1. 完全退出 DeepSeek Harness（连托盘一起退）
-node scripts/diagnose.mjs --dry-run   # 先体检：会看到 dsh-auth-* 有几十条
-node scripts/repair.mjs --dry-run     # 看会删多少
-node scripts/repair.mjs               # 真删，自动备份原库
+node scripts/diagnose.mjs             # 先体检：会看到 dsh-auth-* 有几十条
+node scripts/repair.mjs --dry-run     # 看会删多少（不改任何数据）
+node scripts/repair.mjs               # 交互终端里会问一次，答 y 才真删
+node scripts/repair.mjs --yes         # 非交互环境（脚本/CI）必须显式加 --yes
 # 2. 重新启动 DSH
 ```
 
 `repair.mjs` 只删 `dsh-auth-*` 那些行，别的 cookie 一条不动 —— 比网上流传的「整个 Cookies 文件删掉」温和得多。
 删之前会自动生成 `Cookies.bak-<时间戳>`。
+
+如果只想留下最新那条（比如怀疑里面有当前会话的凭证）：
+
+```bash
+node scripts/repair.mjs --keep-latest --yes
+```
+
+它按 `creation_utc`（创建时间）挑最新的一条保留，其余删掉。
 
 如果连 DSH 都启动不了、只想手动来：删掉
 `%APPDATA%\@deepseek-ai\dsh-desktop\Network\Cookies` 和同目录的 `Cookies-journal` 即可，效果等价，但会连别的 cookie 一起清掉。
@@ -170,7 +180,15 @@ node test/repair.test.mjs   # 体检/修复脚本，用 Chromium 同结构的 co
 
 ### C. 装插件 + 已攒 76 条（病发机器）
   首次：请求头 17098 字节 → 自愈到 1 条，全程正常
+
+### D. HTTPS 监听（cookie 名按 origin 计算）
+  4 次启动全程正常，库中稳定 1 条
 ```
+
+场景 D 专门盯着 TLS 分支：上游在 https 监听下用 `url.origin` 当 authority，
+插件如果只会算 `host` 形式，就会把当前会话那条当垃圾删掉。
+`simulate.mjs` 里那份上游算法模型必须和 `dsh-client-connection` 保持同步 ——
+它写错就会变成「自己跟自己一致」的自证测试。
 
 ## 取舍说明
 
@@ -180,6 +198,31 @@ node test/repair.test.mjs   # 体检/修复脚本，用 Chromium 同结构的 co
   `payload.authority === authority`），等于放宽鉴权语义；而且改的是 DSH 自己的代码，插件做不到、
   也不该越界。这里选择「保留语义，只清理垃圾」。
 - 插件对 `apply()` 做了整体 try/catch：即使初始化异常也只会打一行警告，不会让 host 启动失败。
+
+## 更新记录
+
+### v0.1.1
+
+一轮针对实现本身的审查，修掉以下问题（都有回归测试）：
+
+- **TLS 监听下会删掉当前会话的 cookie**。上游 `requestAudience()` 在 TLS 监听时返回
+  `url.origin`（带 `https://` 前缀），明文才返回 `url.host`；插件原来只会算 `host` 形式。
+  于是 https 部署下算出的 cookie 名永远对不上真实的，每条历史 cookie（包括当前那条）
+  都会被判定成垃圾删掉，造成 401 死循环。现在按 `webServer.protocol` 分支，与上游一致。
+- **`--keep-latest` 完全不生效**。日志说「保留 1 条」，实际执行的是
+  `DELETE ... WHERE name LIKE 'dsh-auth-%'`，无条件全清。现在按名字逐条删。
+- **`--keep-latest` 排序字段用错**。注释写 `creation_utc`，代码排的是 `expires_utc`；
+  而且 `readCookies()` 的 SELECT 里根本没有 `creation_utc`，排序键恒为 0，留下的是最旧那条。
+- **`--yes` 是死参数**。只被解析、从未使用，`node scripts/repair.mjs` 不带确认就直接改库。
+  现在：交互终端问一次，非交互环境必须显式 `--yes`（否则 exit 4）。
+- **`isSymlink()` 判断错误**。`lstatSync` 成功就返回 `true`，不看类型；
+  走复制兜底时卸载会对真实目录 `rmSync(recursive:false)` 抛错。现在按 `isSymbolicLink()` 判断，
+  真实目录还要先确认 `package.json` 里是本插件才删。
+- 测试补上 `--keep-latest`、无 `--yes` 拒绝、以及 **HTTPS 场景 D**。
+
+### v0.1.0
+
+首个版本。
 
 ## License
 
